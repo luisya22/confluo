@@ -3,6 +3,7 @@ package data
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -51,6 +52,7 @@ func (wm WorkflowModel) Insert(w *Workflow) error {
 	return stmt.QueryRowxContext(ctx, w).Scan(&w.Id)
 }
 
+// TODO: Update trigger_id
 func (wm WorkflowModel) Update(w *Workflow) error {
 	query := `UPDATE workflows SET 
 			name = :name,
@@ -83,14 +85,17 @@ func (wm WorkflowModel) Update(w *Workflow) error {
 }
 
 func (wm WorkflowModel) Get(id string) (*Workflow, error) {
-	// TODO: Join Action
+	rowsFound := false
+
 	query := `SELECT 
-			workflows.id, workflows.name, workflows.trigger_id, workflows.version,
-			workflow_actions.id, workflow_actions.text, workflow_actions.type, workflow_actions.next_action_id, workflow_actions.params 
-			actions.id, actions.provider, actions.operation
+			workflows.id, workflows.name, workflows.trigger_id, workflows.user_id, workflows.version,
+			workflow_actions.id, workflow_actions.text, workflow_actions.type, workflow_actions.next_action_id, workflow_actions.params, workflow_actions.workflow_id, workflow_actions.action_id,
+			actions.id, actions.provider_id, actions.operation,
+			providers.id, providers.name, providers.logo
 		FROM workflows
 		LEFT JOIN workflow_actions on workflows.id = workflow_actions.workflow_id
 		LEFT JOIN actions on workflow_actions.action_id = actions.id
+		LEFT JOIN providers on actions.provider_id = providers.id
 		WHERE workflows.id = $1
 	`
 
@@ -101,40 +106,61 @@ func (wm WorkflowModel) Get(id string) (*Workflow, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	var workflow Workflow
-	actions := []WorkflowAction{}
 
 	for rows.Next() {
+		rowsFound = true
 
 		var workflowAction WorkflowAction
-		rows.Scan(
+		var params []uint8
+		err := rows.Scan(
 			&workflow.Id,
 			&workflow.Name,
 			&workflow.TriggerId,
+			&workflow.UserId,
 			&workflow.Version,
+			&workflowAction.Id,
 			&workflowAction.Text,
 			&workflowAction.Type,
 			&workflowAction.NextActionId,
-			&workflowAction.Params,
+			&params,
+			&workflowAction.WorkflowId,
+			&workflowAction.ActionId,
 			&workflowAction.Action.Id,
-			&workflowAction.Action.Provider,
+			&workflowAction.Action.ProviderId,
 			&workflowAction.Action.Operation,
+			&workflowAction.Action.Provider.Id,
+			&workflowAction.Action.Provider.Name,
+			&workflowAction.Action.Provider.Logo,
 		)
+		if err != nil {
+			return nil, err
+		}
 
-		actions = append(actions, workflowAction)
+		if params != nil {
+			if err := json.Unmarshal(params, &workflowAction.Params); err != nil {
+				return nil, err
+			}
+		}
+
+		workflow.Actions = append(workflow.Actions, workflowAction)
 	}
 
-	workflow.Actions = actions
+	if !rowsFound {
+		return nil, ErrRecordNotFound
+	}
 
 	return &workflow, nil
 }
 
 func (wm WorkflowModel) GetAll(userId string, filters Filters) ([]*Workflow, Metadata, error) {
-	query := `SELECT w.id, w.name. w.trigger_id, w.version, STRING_AGG(a.provider, ',')
+	query := `SELECT w.id, w.name. w.trigger_id, w.version, STRING_AGG(a.operation), STRING_AGG(p.name, ',')
 		FROM workflows w
 		LEFT JOIN workflow_actions wa ON w.id = wa.workflow_id
 		LEFT JOIN actions a ON wa.action_id = a.id
+		LEFT JOIN provider p ON a.provider_id = a.action_id
 		WHERE uerId = $1
 		GROUP BY w.id	
 	`
@@ -154,6 +180,7 @@ func (wm WorkflowModel) GetAll(userId string, filters Filters) ([]*Workflow, Met
 	for rows.Next() {
 		var workflow Workflow
 		var actionsStr string
+		var providerStr string
 		var actions []WorkflowAction
 
 		err := rows.Scan(
@@ -162,17 +189,22 @@ func (wm WorkflowModel) GetAll(userId string, filters Filters) ([]*Workflow, Met
 			&workflow.TriggerId,
 			&workflow.Version,
 			&actionsStr,
+			&providerStr,
 		)
 		if err != nil {
 			return nil, Metadata{}, err
 		}
 
 		actionsSpl := strings.Split(actionsStr, ",")
+		providersSpl := strings.Split(providerStr, ",")
 
-		for _, action := range actionsSpl {
+		for i := 0; i < len(actionsSpl); i++ {
 			a := WorkflowAction{
 				Action: Action{
-					Provider: action,
+					Operation: actionsSpl[i],
+					Provider: Provider{
+						Name: providersSpl[i],
+					},
 				},
 			}
 			actions = append(actions, a)
@@ -188,12 +220,32 @@ func (wm WorkflowModel) GetAll(userId string, filters Filters) ([]*Workflow, Met
 }
 
 func (wm WorkflowModel) Delete(id string) error {
-	query := `DELETE FROM workflows WHERE id = $1`
+	query := `UPDATE workflows SET trigger_id = null WHERE id = $1`
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+	ctx, cancelU := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelU()
+
+	_, err := wm.DB.ExecContext(ctx, query, id)
+	if err != nil {
+		return err
+	}
+
+	query = `DELETE FROM workflow_actions WHERE workflow_id = $1`
+
+	ctx, cancelWA := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelWA()
 
 	result, err := wm.DB.ExecContext(ctx, query, id)
+	if err != nil {
+		return err
+	}
+
+	query = `DELETE FROM workflows WHERE id = $1`
+
+	ctx, cancelW := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelW()
+
+	result, err = wm.DB.ExecContext(ctx, query, id)
 	if err != nil {
 		return err
 	}
