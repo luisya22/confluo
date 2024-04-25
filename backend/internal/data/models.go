@@ -12,12 +12,18 @@ var (
 )
 
 type Models struct {
-	Workflows WorkflowModel
+	Workflows       WorkflowModel
+	WorkflowActions WorkFlowActionModel
+	Actions         ActionModel
+	Providers       ProviderModel
 }
 
 func NewModels(db *sqlx.DB) Models {
 
 	return Models{
-		Workflows: WorkflowModel{DB: db},
+		Workflows:       WorkflowModel{DB: db},
+		WorkflowActions: WorkFlowActionModel{DB: db},
+		Actions:         ActionModel{DB: db},
+		Providers:       ProviderModel{DB: db},
 	}
 }
